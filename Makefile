@@ -10,7 +10,7 @@ formal:
 
 .PHONY: estimator
 estimator:
-	@sbt "runMain estimate.EstimateCR"
+	@sbt "runMain estimate.LPECompEstimateCR"
 
 clean:
 	rm -f *.anno.json
