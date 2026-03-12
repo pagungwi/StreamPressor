@@ -3,7 +3,7 @@ package szx
 import chisel3._
 import chisel3.util._
 
-class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32) extends Module {
+class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32, val parallelWidth: Int = 8) extends Module {
   val io = IO(new Bundle {
     val inputData = Input(Vec(blockSize, UInt(dataWidth.W)))
     val inputValid = Input(Bool())
@@ -67,9 +67,9 @@ class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32) extend
   // Parallel processing registers
   val parallelProcessing = RegInit(false.B)
   val parallelIndex = RegInit(0.U((log2Ceil(blockSize) + 1).W))
-  val parallelResults = RegInit(VecInit(Seq.fill(8)(0.U(dataWidth.W))))  // Increased from 4 to 8
-  val parallelLeadingNums = RegInit(VecInit(Seq.fill(8)(0.U(2.W))))     // Increased from 4 to 8
-  val parallelResiduals = RegInit(VecInit(Seq.fill(32)(0.U(8.W))))      // Increased from 16 to 32 (8 elements * 4 bytes max)
+  val parallelResults = RegInit(VecInit(Seq.fill(parallelWidth)(0.U(dataWidth.W))))  // Increased from 4 to 8 **NEW** made this, and others like it, dynamic insead of 8
+  val parallelLeadingNums = RegInit(VecInit(Seq.fill(parallelWidth)(0.U(2.W))))     // Increased from 4 to 8
+  val parallelResiduals = RegInit(VecInit(Seq.fill(parallelWidth*4)(0.U(8.W))))      // Increased from 16 to 32 (8 elements * 4 bytes max)
   val parallelResidualIndex = RegInit(0.U(6.W))
 
   // Prefetch buffer (disabled for now)
@@ -171,7 +171,7 @@ class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32) extend
       // Simple parallel processing - just process 8 elements at once without complex residual tracking
   def processParallelElements(startIdx: UInt): Unit = {
     // Process 8 elements in parallel (debug output removed for performance)
-    for (i <- 0 until 8) {
+    for (i <- 0 until parallelWidth) {
       val elementIdx = startIdx + i.U
       when(elementIdx < blockSize.U) {
         // For sFindStats: find min/max
@@ -238,7 +238,7 @@ class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32) extend
           }
 
           // Update prevValue for next iteration
-          when(i.U === 7.U) {  // Changed from 3.U to 7.U for 8 elements
+          when(i.U === (parallelWidth - 1).U) {  // Changed from 3.U to 7.U for 8 elements 
             prevValue := shiftedValue
           }
         }
@@ -247,7 +247,7 @@ class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32) extend
 
     // Simple residual index update - just increment by a fixed amount per batch
     when(state === sCompress) {
-      residualIndex := residualIndex + (8.U * reqBytesLength)  // Changed from 4.U to 8.U
+      residualIndex := residualIndex + (parallelWidth.U * reqBytesLength)  // Changed from 4.U to 8.U
     }
   }
 
@@ -275,12 +275,12 @@ class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32) extend
         printf("SZxBlockProcessor: Starting sFindStats, processingIndex=%d\n", processingIndex)
         minVal := inputReg(0)
         maxVal := inputReg(0)
-        processingIndex := processingIndex + 8.U  // Process 8 elements at once
+        processingIndex := processingIndex + parallelWidth.U  // Process 8 elements at once **Now processes a dynamic amount of elements at once
         printf("SZxBlockProcessor: Set initial min/max, next processingIndex=%d\n", processingIndex)
       }.elsewhen(processingIndex < blockSize.U) {
         printf("SZxBlockProcessor: Parallel processing elements %d-%d\n", processingIndex, processingIndex + 7.U)
         processParallelElements(processingIndex)
-        processingIndex := processingIndex + 8.U  // Process 8 elements at once
+        processingIndex := processingIndex + parallelWidth.U  // Process 8 elements at once
         printf("SZxBlockProcessor: Incremented processingIndex to %d\n", processingIndex)
       }.elsewhen(processingIndex >= blockSize.U) {
         // Calculate range and move to precision calculation
@@ -326,7 +326,7 @@ class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32) extend
       when(processingIndex < blockSize.U) {
         // Parallel SZx compression algorithm (debug output removed for performance)
         processParallelElements(processingIndex)
-        processingIndex := processingIndex + 8.U  // Process 8 elements at once
+        processingIndex := processingIndex + parallelWidth.U  // Process 8 elements at once
       }.otherwise {
         // Compression complete, prepare output
         compressionEndCycle := debugCounter

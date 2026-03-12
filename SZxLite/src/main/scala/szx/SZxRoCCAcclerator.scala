@@ -6,7 +6,7 @@ import freechips.rocketchip.tile._
 import org.chipsalliance.cde.config._
 import freechips.rocketchip.rocket._
 
-class SZxRoCCAccelerator(opcodes: OpcodeSet)(implicit p: Parameters)
+class SZxRoCCAccelerator(opcodes: OpcodeSet, val parallelWidth: Int = 8)(implicit p: Parameters)
   extends LazyRoCC(opcodes) {
 
   override lazy val module = new SZxRoCCAcceleratorModule(this)
@@ -28,7 +28,7 @@ class SZxRoCCAcceleratorModule(outer: SZxRoCCAccelerator)(implicit p: Parameters
   val radius = RegInit(0.U(32.W))
 
   // Block processor instance - this is the actual SZx compression hardware
-  val blockProcessor = Module(new SZxBlockProcessor(64, 32))
+  val blockProcessor = Module(new SZxBlockProcessor(64, 32, outer.parallelWidth))
 
   // Command decoding
   val cmd_rs1 = io.cmd.bits.rs1.asUInt
