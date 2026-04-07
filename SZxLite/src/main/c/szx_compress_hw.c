@@ -7,6 +7,9 @@
 #include <time.h>
 #include "rocc.h"
 
+// Prev malloc() were arbitrarily aligned buffers - ROCC L1D cache is 64B
+// Defines lenght of cache line and matches SZxROCCConfig.scala
+#define SZX_CACHE_LINE_BYTES 64
 // Hardware acceleration control
 int g_use_hardware_acceleration = 1; // Global flag controlled from main (0 = use software, 1 = use hardware)
 
@@ -147,7 +150,7 @@ void SZx_compress_one_block_float_sw(float *oriData, size_t nbEle, float absErrB
                                     unsigned char *leadNumberArray_int, float medianValue,
                                     float radius);
 
-// Hardware-accelerated block compression function
+/* OLD Hardware-accelerated block compression function
 void SZx_compress_one_block_float_hw(float *oriData, size_t nbEle, float absErrBound,
                                            unsigned char *outputBytes, int *outSize,
                                            unsigned char *leadNumberArray_int, float medianValue,
@@ -170,6 +173,44 @@ void SZx_compress_one_block_float_hw(float *oriData, size_t nbEle, float absErrB
 
     // The RoCC accelerator should have written the compressed data to outputBytes
     // The size should be the actual compressed size from the hardware
+} */
+/* NEW Hardware-accelerated block compression function
+    - SZx_compress_float responsible for passing cache-aligned pointer
+    - szx_load_block_bulk() given aligned pointer and explicit word count
+    - szx_compress() given only output buffer (input address no longer needed after bulk load)
+    - Add assertion to catch misaligned pointers at runtime
+*/
+void SZx_compress_one_block_float_hw(float *oriData, size_t nbEle, float absErrBound,
+                                           unsigned char *outputBytes, int *outSize,
+                                           unsigned char *leadNumberArray_int, float medianValue,
+                                           float radius) {
+    // Runtime alignment check - ensure use posix_memalign
+    if ((uintptr_t)oriData % SZX_CACHE_LINE_BYTES != 0) {
+        fprintf(stderr, "SZx HW WARNING: oriData pointer %p is not %d-byte aligned. "
+                "Cache line straddling will occur.\n", (void*)oriData, SZX_CACHE_LINE_BYTES);
+    }
+    printf("HW: Starting hardware compression\n");
+ 
+    // Configure the accelerator with error bound, median, and radius
+    szx_config(absErrBound, medianValue);
+    szx_set_radius(radius);
+ 
+    /* Bulk load using the hardware's io.mem path (funct=6).
+        - HW sBulkLoad state issues requests to fetch nbEle 32-bit words from address of oriData
+        - Use bulkTransferAddr + (bulkTransferIndex << 2) to step through each word
+        - Return a response once all nbEle words have been fetched and stored in scratchpad
+
+        Adds resilience for 64b build to map to 32b RoCC register
+    */
+    szx_load_block_bulk((uint32_t)(uintptr_t)oriData, (uint32_t)nbEle);
+ 
+    /* Compress data from HW scratchpad instead of CPU-side address
+        - Maps to COMPRESS_BLOCK and GET_RESULT in HW state machine
+    */
+    uint32_t compressed_size = szx_compress_from_scratchpad(outputBytes);
+ 
+    printf("HW: RoCC compression complete, size: %u\n", compressed_size);
+    *outSize = compressed_size;
 }
 
 // Original software block compression function
@@ -398,12 +439,28 @@ inline size_t convertIntArray2ByteArray_fast_2b_args(unsigned char* timeStepType
 unsigned char *
 SZx_compress_float(float *oriData, size_t *outSize, float absErrBound,
     size_t nbEle, int blockSize) {
+
+    // oriData alignment check that prints warning for test application
+    if ((uintptr_t)oriData % SZX_CACHE_LINE_BYTES != 0) {
+        fprintf(stderr, "SZx WARNING: oriData %p is not %d-byte aligned. "
+                "Hardware bulk load may straddle cache line boundaries. "
+                "Use posix_memalign in the caller.\n",
+                (void*)oriData, SZX_CACHE_LINE_BYTES);
+    }
+    
     float *op = oriData;
 
     *outSize = 0;
     size_t maxPreservedBufferSize =
             sizeof(float) * nbEle; //assume that the compressed data size would not exceed the original size
-    unsigned char *outputBytes = (unsigned char *) malloc(maxPreservedBufferSize);
+    
+    // Aligned output buffer allocation: changing mallocs to cache-aligned wit posix_memalign()
+    size_t alignedSize = ((maxPreservedBufferSize + SZX_CACHE_LINE_BYTES - 1) / SZX_CACHE_LINE_BYTES) * SZX_CACHE_LINE_BYTES;
+    unsigned char *outputBytes = NULL;
+    if (posix_memalign((void**)&outputBytes, SZX_CACHE_LINE_BYTES, alignedSize) != 0) {
+        fprintf(stderr, "SZx ERROR: posix_memalign failed for outputBytes\n");
+        return NULL;
+    }
 
     unsigned char *leadNumberArray_int = (unsigned char *) malloc(blockSize * sizeof(int));
 
@@ -449,6 +506,10 @@ SZx_compress_float(float *oriData, size_t *outSize, float absErrBound,
     printf("Processing %lu blocks, %lu non-constant blocks\n", nbBlocks, nbNonConstantBlocks);
     fflush(stdout);
 
+    /*
+        Advance by blockSize # of floats each iteration
+        Prefetch all cache lines needed to get all floats for that next block to be processed
+    */
     for (i = 0; i < nbBlocks; i++, op += blockSize) {
         // Only print for first 5 blocks and then every 10th block
         if (i < 5 || i % 10 == 0) {
