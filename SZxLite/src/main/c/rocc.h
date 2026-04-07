@@ -143,6 +143,16 @@ static inline uint32_t szx_compress(float* input_data, uint8_t* output_data) {
     return compressed_size;
 }
 
+/* Compress data already loaded into HW scratchpad via szx_load_block_bulk() and return compressed size in bytes */
+static inline uint32_t szx_compress_from_scratchpad(uint8_t* output_data) {
+    uint32_t temp;
+    ROCC_INSTRUCTION_DSS(0, temp, 0, 0, SZX_COMPRESS);
+  
+    uint32_t compressed_size;
+    ROCC_INSTRUCTION_DSS(0, compressed_size, 0, 0, SZX_GET_RESULT);
+    return compressed_size;
+}
+
 static inline uint32_t szx_compress_multi(float* input_data, uint8_t* output_data) {
     uint64_t input_addr = (uint64_t)input_data;
     uint64_t output_addr = (uint64_t)output_data;
