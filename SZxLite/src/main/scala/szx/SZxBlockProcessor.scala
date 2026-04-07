@@ -3,7 +3,9 @@ package szx
 import chisel3._
 import chisel3.util._
 
-class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32, val parallelWidth: Int = 8) extends Module {
+class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32, val parallelWidth: Int = 8, val cacheLineBytes: Int = 64) extends Module {
+  
+  require((blockSize * dataWidth / 8) % cacheLineBytes == 0, s"Block size (${blockSize * dataWidth / 8} bytes) must be a multiple of cache line size ($cacheLineBytes bytes)")
   val io = IO(new Bundle {
     val inputData = Input(Vec(blockSize, UInt(dataWidth.W)))
     val inputValid = Input(Bool())
@@ -70,7 +72,7 @@ class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32, val pa
   val parallelResults = RegInit(VecInit(Seq.fill(parallelWidth)(0.U(dataWidth.W))))  // Increased from 4 to 8 **NEW** made this, and others like it, dynamic insead of 8
   val parallelLeadingNums = RegInit(VecInit(Seq.fill(parallelWidth)(0.U(2.W))))     // Increased from 4 to 8
   val parallelResiduals = RegInit(VecInit(Seq.fill(parallelWidth*4)(0.U(8.W))))      // Increased from 16 to 32 (8 elements * 4 bytes max)
-  val parallelResidualIndex = RegInit(0.U(6.W))
+  val parallelResidualIndex = RegInit(0.U(log2Ceil(parallelWidth * 4 + 1).W))        // Adjusted to avoid overflow for higher parallelWidth
 
   // Prefetch buffer (disabled for now)
   // val prefetchBuffer = RegInit(VecInit(Seq.fill(blockSize)(0.U(dataWidth.W))))
@@ -167,6 +169,13 @@ class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32, val pa
       (value(31, 24) === 0.U) -> 1.U(2.W)
     ))
   }
+  
+  // Helper that computes how many residual bytes one element emits given its leadingNum.
+      // Builds the prefix-sum of byte offsets across the parallel batch
+      // bytes emitted = max(0, reqBytesLength - leadingNum)
+  def bytesForElement(leadingNum: UInt): UInt = {
+    Mux(leadingNum >= reqBytesLength, 0.U, reqBytesLength - leadingNum)
+  }
 
       // Simple parallel processing - just process 8 elements at once without complex residual tracking
   def processParallelElements(startIdx: UInt): Unit = {
@@ -186,17 +195,93 @@ class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32, val pa
 
         // For sCompress: compress elements
         when(state === sCompress) {
-          val currentValue = inputReg(elementIdx) - io.medianValue
-          val shiftedValue = currentValue >> rightShiftBits
-          val xorResult = shiftedValue ^ prevValue
-          val leadingNum = detectLeadingZeros(xorResult)
+          val currentValue = inputReg(elementIdx) - io.medianValue // quantize by subtracting median
+          val shiftedValue = currentValue >> rightShiftBits   // shift to required precision
+          val xorResult = shiftedValue ^ prevValue  // Xor with previous value to exploit temporal correlation
+          val leadingNum = detectLeadingZeros(xorResult)  // record how many zero bytes can be skipped
 
           // Store results for this element
           parallelResults(i) := shiftedValue
           parallelLeadingNums(i) := leadingNum
           leadingNumbers(elementIdx) := leadingNum
-
-          // Store residual bytes for this element
+        }
+      }
+    }
+    // Implement byte-offset prefix-sum
+    /*
+        byteOffsets has parallelWidth+1 entries
+        byteOffsets(0) = residualIndex (where this batch starts in the global buffer)
+        byteOffsets(i+1) = byteOffsets(i) + bytes emitted by element i
+        byteOffsets(parallelWidth) = new value of residualIndex after this batch
+    */
+    when(state === sCompress) {
+      val byteOffsets = Wire(Vec(parallelWidth + 1, UInt(log2Ceil(blockSize * 4 + 1).W))) // combination Wire (not a register) -- values computed in same cycle
+      byteOffsets(0) := residualIndex
+ 
+      for (i <- 0 until parallelWidth) {
+        val elementIdx = startIdx + i.U
+        // If the element index is out of range, it contributes 0 bytes.
+        val inRange = elementIdx < blockSize.U
+        val leadingNum = parallelLeadingNums(i)
+        val emitted = Mux(inRange, bytesForElement(leadingNum), 0.U)
+        byteOffsets(i + 1) := byteOffsets(i) + emitted
+      }
+ 
+      // Write the residual bytes for each element using its correct offset
+      for (i <- 0 until parallelWidth) {
+        val elementIdx = startIdx + i.U
+        when(elementIdx < blockSize.U) {
+          val base = byteOffsets(i)
+          val sv = parallelResults(i)
+          val ln = parallelLeadingNums(i)
+ 
+          // Write only the bytes that are not skipped by leading-zero compression.
+          // reqBytesLength = total bytes for one element at full precision
+          // leadingNum = how many leading bytes are zero and can be omitted
+          // We write bytes from the most-significant non-skipped byte downward
+          when(reqBytesLength === 1.U) {
+            when(ln === 0.U) {
+              residualBytes(base) := sv(7, 0)
+            }
+          }.elsewhen(reqBytesLength === 2.U) {
+            when(ln === 0.U) {
+              residualBytes(base)     := sv(23, 16)
+              residualBytes(base + 1.U) := sv(15, 8)
+            }.elsewhen(ln === 1.U) {
+              residualBytes(base) := sv(23, 16)
+            }
+          }.elsewhen(reqBytesLength === 3.U) {
+            when(ln === 0.U) {
+              residualBytes(base)     := sv(23, 16)
+              residualBytes(base + 1.U) := sv(15, 8)
+              residualBytes(base + 2.U) := sv(7, 0)
+            }.elsewhen(ln === 1.U) {
+              residualBytes(base)     := sv(23, 16)
+              residualBytes(base + 1.U) := sv(15, 8)
+            }.elsewhen(ln === 2.U) {
+              residualBytes(base) := sv(23, 16)
+            }
+          }.otherwise { // reqBytesLength === 4
+            when(ln === 0.U) {
+              residualBytes(base)     := sv(31, 24)
+              residualBytes(base + 1.U) := sv(23, 16)
+              residualBytes(base + 2.U) := sv(15, 8)
+              residualBytes(base + 3.U) := sv(7, 0)
+            }.elsewhen(ln === 1.U) {
+              residualBytes(base)     := sv(31, 24)
+              residualBytes(base + 1.U) := sv(23, 16)
+              residualBytes(base + 2.U) := sv(15, 8)
+            }.elsewhen(ln === 2.U) {
+              residualBytes(base)     := sv(31, 24)
+              residualBytes(base + 1.U) := sv(23, 16)
+            }.otherwise { // ln === 3
+              residualBytes(base) := sv(31, 24)
+            }
+          }
+        }
+      }      
+          // Store residual bytes for this element - OLD
+          /*
           when(reqBytesLength === 2.U) {
             when(leadingNum === 0.U) {
               residualBytes(residualIndex + (i * 2).U) := shiftedValue(23, 16)
@@ -237,17 +322,32 @@ class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32, val pa
             }
           }
 
-          // Update prevValue for next iteration
+          /* Update prevValue for next iteration
           when(i.U === (parallelWidth - 1).U) {  // Changed from 3.U to 7.U for 8 elements 
             prevValue := shiftedValue
+          } */
+          val lastElement = startIdx + (parallelWidth - 1).U
+          when(lastElement < blockSize.U) {
+            prevValue :=
           }
         }
       }
     }
-
+    
     // Simple residual index update - just increment by a fixed amount per batch
     when(state === sCompress) {
       residualIndex := residualIndex + (parallelWidth.U * reqBytesLength)  // Changed from 4.U to 8.U
+    }
+  }
+  */
+      residualIndex := byteOffsets(parallelWidth) // Update residualIndex to the end of this batch using prefix-sum result
+    
+      val prevValueCandidates = (0 until parallelWidth).reverse.map { i =>
+        val elementIdx = startIdx + i.U
+        val inRange = elementIdx < blockSize.U
+        inRange -> parallelResults(i)
+      }
+      prevValue := MuxCase(prevValue, prevValueCandidates)
     }
   }
 
@@ -278,7 +378,7 @@ class SZxBlockProcessor(val blockSize: Int = 64, val dataWidth: Int = 32, val pa
         processingIndex := processingIndex + parallelWidth.U  // Process 8 elements at once **Now processes a dynamic amount of elements at once
         printf("SZxBlockProcessor: Set initial min/max, next processingIndex=%d\n", processingIndex)
       }.elsewhen(processingIndex < blockSize.U) {
-        printf("SZxBlockProcessor: Parallel processing elements %d-%d\n", processingIndex, processingIndex + 7.U)
+        printf("SZxBlockProcessor: Parallel processing elements %d-%d\n", processingIndex, processingIndex + (parallelWidth -1).U)
         processParallelElements(processingIndex)
         processingIndex := processingIndex + parallelWidth.U  // Process 8 elements at once
         printf("SZxBlockProcessor: Incremented processingIndex to %d\n", processingIndex)

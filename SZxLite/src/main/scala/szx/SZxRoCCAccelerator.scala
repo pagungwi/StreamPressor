@@ -6,7 +6,8 @@ import freechips.rocketchip.tile._
 import org.chipsalliance.cde.config._
 import freechips.rocketchip.rocket._
 
-class SZxRoCCAccelerator(opcodes: OpcodeSet, val parallelWidth: Int = 8)(implicit p: Parameters)
+/* Added parallelWidth and cache-aware memory access parameters */
+class SZxRoCCAccelerator(opcodes: OpcodeSet, val parallelWidth: Int = 8, val cacheLineBytes: Int 64, val burstWords: Int = 16)(implicit p: Parameters)
   extends LazyRoCC(opcodes) {
 
   override lazy val module = new SZxRoCCAcceleratorModule(this)
@@ -28,8 +29,9 @@ class SZxRoCCAcceleratorModule(outer: SZxRoCCAccelerator)(implicit p: Parameters
   val radius = RegInit(0.U(32.W))
 
   // Block processor instance - this is the actual SZx compression hardware
-  val blockProcessor = Module(new SZxBlockProcessor(64, 32, outer.parallelWidth))
-
+  val blockProcessor = Module(new SZxBlockProcessor(64, 32, outer.parallelWidth, outer.cacheLineBytes))
+  val wordLengthBytes = outer.cacheLineBytes / outer.burstWords
+  
   // Command decoding
   val cmd_rs1 = io.cmd.bits.rs1.asUInt
   val cmd_rs2 = io.cmd.bits.rs2.asUInt
@@ -66,6 +68,8 @@ class SZxRoCCAcceleratorModule(outer: SZxRoCCAccelerator)(implicit p: Parameters
   // Bulk transfer registers (new for optimization)
   val bulkTransferIndex = RegInit(0.U(8.W))
   val bulkTransferAddr = RegInit(0.U(32.W))
+  // New: Cache-aware registers
+  val responsesReceived = RegInit(0.U(log2Ceil(blockSize + 1).W))
 
   // DMA-like bulk transfer registers (disabled for now)
   // val dmaTransferActive = RegInit(false.B)
@@ -90,6 +94,13 @@ class SZxRoCCAcceleratorModule(outer: SZxRoCCAccelerator)(implicit p: Parameters
     printf("SZxRoCC: CMD FIRE! funct=%d, rs1=0x%x, rs2=0x%x, rd=%d\n",
            io.cmd.bits.inst.funct, io.cmd.bits.rs1, io.cmd.bits.rs2, io.cmd.bits.inst.rd)
   }
+  
+  // Request default signal assignment
+  io.mem.req.valid := false.B // default - overriden in sBulkLoad
+  io.mem.req.bits.addr := 0.U
+  io.mem.req.bits.cmd := M_XRD
+  io.mem.req.bits.size := log2Ceil(wordLengthBytes).U
+  io.mem.req.bits.tag := 0.U
 
   // Response handling - return the actual compressed size from hardware
   io.resp.valid := (state === sComplete)
@@ -179,6 +190,7 @@ class SZxRoCCAcceleratorModule(outer: SZxRoCCAccelerator)(implicit p: Parameters
             // This eliminates 64 individual RoCC calls per block
             bulkTransferAddr := blockStartAddr
             bulkTransferIndex := 0.U
+            responsesReceived := 0.U // reset responses received for BulkLoad
             state := sBulkLoad
           }
         }
@@ -285,16 +297,34 @@ class SZxRoCCAcceleratorModule(outer: SZxRoCCAccelerator)(implicit p: Parameters
       compressedSize := outputSize
       state := sComplete
     }
+    /* In Bulk Load state: request entire block of data and store in local high-speed buffer/scratchpad */
     is(sBulkLoad) {
+      
       // Load 4 words per cycle (16 bytes per cycle)
       when(bulkTransferIndex < blockSize.U) {
-        // Simulate bulk transfer - in real implementation, this would use DMA
-        scratchpad(bulkTransferIndex) := bulkTransferAddr + (bulkTransferIndex << 2)
-        bulkTransferIndex := bulkTransferIndex + 1.U
-      }.otherwise {
+        // Replace simulated block transfer with actual load using RoCC mem port
+            // io.mem.req: wires between accelerator (requester) and memory system (responder) - valid/ready handshake
+        io.mem.req.valid := true.B // accelerator ready to receive data from memory system
+        io.mem.req.bits.tag := bulkTransferIndex // use word index as tag
+        io.mem.req.bits.addr := bulkTransferAddr + (bulkTransferIndex << 2)
+        io.mem.req.bits.cmd := M_XRD // memory read
+        io.mem.req.bits.size := log2Ceil(wordLengthBytes).U // calculate word granularity (4B default)
+        
+        when(io.mem.req.fire) { // check valid and ready
+          bulkTransferIndex := bulkTransferIndex + 1.U
+        }
+      }
+      
+      // Capture responses, use tag matching for handling out-of-order reception
+      when(io.mem.resp.valid) {
+        scratchpad(io.mem.resp.bits.tag) := io.mem.resp.bits.data(wordLengthBytes*8-1, 0)
+        responsesReceived := responsesReceived + 1.U // increment counter on valid receive
+      }
+      
+      when(bulkTransferIndex >= blockSize.U && responsesReceived >= blockSize.U) {
         // Bulk transfer complete, start compression
         printf("SZxRoCC: Bulk transfer complete, starting compression\n")
-        state := sProcessBlock
+        state := sProcessBlock // advance to next state
         dataIndex := 0.U
       }
     }
